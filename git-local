@@ -235,39 +235,13 @@ def cmd_save(args):
             return
 
     pp.write_text(patch_text)
-    print(f"\n{GREEN}✓ Patch saved:{RESET} {DIM}{pp}{RESET}")
+    print(f"\n{GREEN}✓ Patch saved — local changes remain applied{RESET}")
 
-    # Revert the selected hunks from the working tree so the repo is clean
-    r = run(
-        ["git", "apply", "--reverse", "--index", "--whitespace=fix", "-"],
-        input=patch_text,
-        text=True,
-        capture_output=True,
-        cwd=git_root(),
-    )
-    if r.returncode != 0:
-        # --index fails if not staged; fall back to working-tree-only
-        r = run(
-            ["git", "apply", "--reverse", "--whitespace=fix", "-"],
-            input=patch_text,
-            text=True,
-            capture_output=True,
-            cwd=git_root(),
-        )
-    if r.returncode != 0:
-        print(f"\n{YELLOW}⚠  Could not auto-revert hunks from the working tree:{RESET}")
-        print(f"   {r.stderr.strip()}")
-        print(f"   Your local changes are still present — the patch is saved for later.")
-        state = load_state()
-        state[rel] = "applied"
-    else:
-        print(f"{GREEN}✓ Hunks reverted from working tree (patch stored, not applied){RESET}")
-        state = load_state()
-        state[rel] = "stripped"
-
+    # Mark as applied — changes are already in the working tree
+    state = load_state()
+    state[rel] = "applied"
     save_state(state)
-    print(f"\n{DIM}  git-local apply        — restore your local changes{RESET}")
-    print(f"{DIM}  git-local install-hooks — automate strip/apply around commits{RESET}\n")
+    print(f"\n{DIM}  git-local install-hooks — automate strip/apply around commits{RESET}\n")
 
 
 def cmd_apply(args):

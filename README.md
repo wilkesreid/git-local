@@ -56,13 +56,13 @@ git local save vite.config.ts   # same as: git-local save vite.config.ts
 ## Typical Workflow
 
 ```sh
-# 1. Make your local-only change in the file as normal
-
-# 2. Save the hunk(s) you want to keep local — interactive picker like `git add -p`
-git-local save vite.config.ts
-
-# 3. Install hooks so commits strip/re-apply automatically (one-time setup per repo)
+# 1. Install hooks so commits strip/re-apply automatically (one-time setup per repo)
 git-local install-hooks
+
+# 2. Make your local-only change in the file as normal
+
+# 3. Save the hunk(s) you want to keep local — interactive picker like `git add -p`
+git-local save vite.config.ts
 
 # 4. Work normally — commit, push, pull. The patch stays in .git/ and never goes out.
 git add . && git commit -m "feat: whatever"
@@ -87,8 +87,6 @@ Prompts for each hunk:
 - `n` — skip (leave this hunk as a normal staged/unstaged change)
 - `a` — save all remaining hunks without prompting
 - `q` — quit without saving
-
-After saving, the selected hunks are immediately reverted from the working tree and index, so your repo is in a clean committable state.
 
 **Flags:**
 
@@ -249,8 +247,6 @@ git-local show vite.config.ts
 # 3. Re-capture the patch, replacing the old one
 git-local save -a --replace vite.config.ts
 ```
-
-This is equivalent to resolving a rebase conflict — rare, and solvable in under a minute.
 
 ### Working without hooks
 
