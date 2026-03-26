@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""
+git-local — Persist local-only changes in git-tracked files.
+
+Patches are stored in .git/local-patches/ — inside .git so they are never
+committed, never pushed, and never need a .gitignore entry.
+
+Commands:
+  save <file>        Interactively select hunks to mark as local-only
+  apply [files...]   Apply saved patches to the working tree
+  strip [files...]   Remove local patches from the working tree
+  list               List all saved patches and their status
+  status             Verify actual applied/stripped state via dry-run
+  show <file>        Display the saved patch for a file
+  drop <file>        Delete the saved patch for a file
+  install-hooks      Install pre-commit / post-commit automation hooks
+"""
+
+import os
+import sys
+import re
+import json
+import subprocess
+import argparse
+from pathlib import Path
+
+# ── Terminal colours ──────────────────────────────────────────────────────────
+
+def _supports_color():
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+if _supports_color():
+    RESET  = "\033[0m"
+    RED    = "\033[31m"
+    GREEN  = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN   = "\033[36m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+else:
+    RESET = RED = GREEN = YELLOW = CYAN = BOLD = DIM = ""
+
+# ── Git helpers ───────────────────────────────────────────────────────────────
+
+def run(cmd, **kwargs):
+    return subprocess.run(cmd, **kwargs)
+
+
+def git_root() -> Path:
+    r = run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"{RED}Error: not inside a git repository.{RESET}", file=sys.stderr)
+        sys.exit(1)
+    return Path(r.stdout.strip())
+
+
+def git_dir() -> Path:
+    r = run(["git", "rev-parse", "--git-dir"], capture_output=True, text=True)
+    return Path(r.stdout.strip())
+
+
+def patches_dir() -> Path:
+    d = git_dir() / "local-patches"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def patch_file(rel_file: str) -> Path:
+    """Derive a safe filename for the patch — slashes become double-underscores."""
+    safe = rel_file.replace("\\", "/").replace("/", "__")
+    return patches_dir() / f"{safe}.patch"
+
+
+def rel_file_from_patch(pp: Path) -> str:
+    return pp.stem.replace("__", "/")
+
+
+def state_file() -> Path:
+    return patches_dir() / ".state.json"
+
+
+def load_state() -> dict:
+    p = state_file()
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def save_state(state: dict):
+    state_file().write_text(json.dumps(state, indent=2))
+
+
+def resolve_rel(file: str) -> str:
+    """Return the path relative to the git root, normalised with forward slashes."""
+    root = git_root()
+    try:
+        rel = Path(file).resolve().relative_to(root)
+    except ValueError:
+        rel = Path(file)
+    return str(rel).replace("\\", "/")
+
+# ── Diff / patch helpers ──────────────────────────────────────────────────────
+
+def get_diff(rel: str) -> str:
+    """Return all changes vs HEAD (staged or unstaged) for the given file."""
+    # git diff HEAD shows everything modified relative to the last commit,
+    # regardless of whether it's staged or not.
+    r = run(["git", "diff", "HEAD", "--", rel], capture_output=True, text=True)
+    return r.stdout
+
+
+def parse_hunks(diff: str) -> list:
+    """
+    Split a unified diff into individual hunks.
+    Returns a list of dicts: {header, lines, patch}
+    """
+    lines = diff.splitlines(keepends=True)
+    header, hunks = [], []
+    i = 0
+
+    while i < len(lines) and not lines[i].startswith("@@"):
+        header.append(lines[i])
+        i += 1
+
+    while i < len(lines):
+        if lines[i].startswith("@@"):
+            hunk_lines = [lines[i]]
+            i += 1
+            while i < len(lines) and not lines[i].startswith("@@"):
+                hunk_lines.append(lines[i])
+                i += 1
+            hunks.append({
+                "header": header,
+                "lines": hunk_lines,
+                "patch": "".join(header) + "".join(hunk_lines),
+            })
+        else:
+            i += 1
+
+    return hunks
+
+
+def colorize_diff(text: str) -> str:
+    out = []
+    for line in text.splitlines():
+        if line.startswith(("+++", "---")):
+            out.append(f"{BOLD}{line}{RESET}")
+        elif line.startswith("+"):
+            out.append(f"{GREEN}{line}{RESET}")
+        elif line.startswith("-"):
+            out.append(f"{RED}{line}{RESET}")
+        elif line.startswith("@@"):
+            out.append(f"{CYAN}{line}{RESET}")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def build_patch(hunks: list) -> str:
+    if not hunks:
+        return ""
+    header = hunks[0]["header"]
+    return "".join(header) + "".join("".join(h["lines"]) for h in hunks)
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_save(args):
+    rel = resolve_rel(args.file)
+    diff = get_diff(rel)
+
+    if not diff:
+        print(f"{YELLOW}No unstaged changes found in: {rel}{RESET}")
+        return
+
+    hunks = parse_hunks(diff)
+    if not hunks:
+        print(f"{YELLOW}Could not parse any hunks from diff for: {rel}{RESET}")
+        return
+
+    print(f"\n{BOLD}Selecting local-only hunks for:{RESET} {CYAN}{rel}{RESET}")
+    print(f"{DIM}  y = save as local  |  n = skip  |  a = save all remaining  |  q = quit{RESET}\n")
+
+    selected = []
+    done = False
+
+    if args.all:
+        selected = hunks
+        done = True
+    else:
+        for i, hunk in enumerate(hunks):
+            if done:
+                break
+            print(f"{BOLD}── Hunk {i + 1}/{len(hunks)} ──────────────────────────────────────{RESET}")
+            print(colorize_diff(hunk["patch"]))
+            print()
+
+            while True:
+                try:
+                    resp = input(f"Save as local-only? [{BOLD}y{RESET}/n/a/q] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print(f"\n{YELLOW}Aborted.{RESET}")
+                    return
+
+                if resp in ("", "y"):
+                    selected.append(hunk)
+                    print(f"  {GREEN}✓ marked as local{RESET}\n")
+                    break
+                elif resp == "n":
+                    print(f"  {DIM}skipped{RESET}\n")
+                    break
+                elif resp == "a":
+                    selected.extend(hunks[i:])
+                    print(f"  {GREEN}✓ saved remaining {len(hunks) - i} hunk(s){RESET}\n")
+                    done = True
+                    break
+                elif resp == "q":
+                    print(f"{YELLOW}Aborted.{RESET}")
+                    return
+
+    if not selected:
+        print(f"{YELLOW}No hunks selected — nothing saved.{RESET}")
+        return
+
+    patch_text = build_patch(selected)
+    pp = patch_file(rel)
+
+    # Guard against overwriting an existing patch
+    if pp.exists() and not args.replace:
+        print(f"\n{YELLOW}A patch already exists for {rel}.{RESET}")
+        try:
+            resp = input(f"Replace it? [y/{BOLD}N{RESET}] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{YELLOW}Aborted.{RESET}")
+            return
+        if resp != "y":
+            print("Aborted.")
+            return
+
+    pp.write_text(patch_text)
+    print(f"\n{GREEN}✓ Patch saved:{RESET} {DIM}{pp}{RESET}")
+
+    # Revert the selected hunks from the working tree so the repo is clean
+    r = run(
+        ["git", "apply", "--reverse", "--index", "--whitespace=fix", "-"],
+        input=patch_text,
+        text=True,
+        capture_output=True,
+        cwd=git_root(),
+    )
+    if r.returncode != 0:
+        # --index fails if not staged; fall back to working-tree-only
+        r = run(
+            ["git", "apply", "--reverse", "--whitespace=fix", "-"],
+            input=patch_text,
+            text=True,
+            capture_output=True,
+            cwd=git_root(),
+        )
+    if r.returncode != 0:
+        print(f"\n{YELLOW}⚠  Could not auto-revert hunks from the working tree:{RESET}")
+        print(f"   {r.stderr.strip()}")
+        print(f"   Your local changes are still present — the patch is saved for later.")
+        state = load_state()
+        state[rel] = "applied"
+    else:
+        print(f"{GREEN}✓ Hunks reverted from working tree (patch stored, not applied){RESET}")
+        state = load_state()
+        state[rel] = "stripped"
+
+    save_state(state)
+    print(f"\n{DIM}  git-local apply        — restore your local changes{RESET}")
+    print(f"{DIM}  git-local install-hooks — automate strip/apply around commits{RESET}\n")
+
+
+def cmd_apply(args):
+    root = git_root()
+    state = load_state()
+    patches = sorted(patches_dir().glob("*.patch"))
+
+    if not patches:
+        print(f"{YELLOW}No local patches found.{RESET}")
+        return
+
+    filter_files = [resolve_rel(f) for f in args.files] if args.files else []
+    applied = 0
+
+    for pp in patches:
+        rel = rel_file_from_patch(pp)
+        if filter_files and not any(rel.endswith(f) or f.endswith(rel) for f in filter_files):
+            continue
+        if state.get(rel) == "applied" and not args.force:
+            print(f"{DIM}  {rel}: already applied  (--force to re-apply){RESET}")
+            continue
+
+        patch_text = pp.read_text()
+        r = run(
+            ["git", "apply", "--whitespace=fix", "-"],
+            input=patch_text, text=True, capture_output=True, cwd=root,
+        )
+        if r.returncode != 0:
+            print(f"{RED}✗ {rel}: failed to apply{RESET}")
+            print(f"  {r.stderr.strip()}")
+            hint = "  The base file may have changed. Run 'git-local show <file>' to inspect the patch."
+            print(f"  {DIM}{hint}{RESET}")
+        else:
+            print(f"{GREEN}✓ {rel}: applied{RESET}")
+            state[rel] = "applied"
+            applied += 1
+
+    save_state(state)
+
+
+def cmd_strip(args):
+    root = git_root()
+    state = load_state()
+    patches = sorted(patches_dir().glob("*.patch"))
+
+    if not patches:
+        print(f"{YELLOW}No local patches found.{RESET}")
+        return
+
+    filter_files = [resolve_rel(f) for f in args.files] if args.files else []
+    stripped = 0
+
+    for pp in patches:
+        rel = rel_file_from_patch(pp)
+        if filter_files and not any(rel.endswith(f) or f.endswith(rel) for f in filter_files):
+            continue
+        if state.get(rel) == "stripped" and not args.force:
+            print(f"{DIM}  {rel}: already stripped  (--force to re-strip){RESET}")
+            continue
+
+        patch_text = pp.read_text()
+        r = run(
+            ["git", "apply", "--reverse", "--index", "--whitespace=fix", "-"],
+            input=patch_text, text=True, capture_output=True, cwd=root,
+        )
+        if r.returncode != 0:
+            # --index fails if the hunk isn't staged; fall back to working-tree-only
+            r2 = run(
+                ["git", "apply", "--reverse", "--whitespace=fix", "-"],
+                input=patch_text, text=True, capture_output=True, cwd=root,
+            )
+            if r2.returncode != 0:
+                print(f"{RED}✗ {rel}: could not strip{RESET}")
+                print(f"  {r2.stderr.strip()}")
+            else:
+                print(f"{GREEN}✓ {rel}: stripped (working tree){RESET}")
+                state[rel] = "stripped"
+                stripped += 1
+        else:
+            print(f"{GREEN}✓ {rel}: stripped (working tree + index){RESET}")
+            state[rel] = "stripped"
+            stripped += 1
+
+    save_state(state)
+
+
+def cmd_list(args):
+    patches = sorted(patches_dir().glob("*.patch"))
+    if not patches:
+        print(f"{DIM}No local patches saved.{RESET}")
+        return
+
+    state = load_state()
+    print(f"\n{BOLD}Local patches:{RESET}\n")
+    for pp in patches:
+        rel = rel_file_from_patch(pp)
+        status = state.get(rel, "unknown")
+        color = GREEN if status == "applied" else YELLOW if status == "stripped" else DIM
+        size = pp.stat().st_size
+        print(f"  {color}[{status:8s}]{RESET}  {rel}  {DIM}({size}B){RESET}")
+    print()
+
+
+def cmd_status(args):
+    """Check actual patch state via dry-run — more accurate than saved state."""
+    patches = sorted(patches_dir().glob("*.patch"))
+    if not patches:
+        print(f"{DIM}No local patches saved.{RESET}")
+        return
+
+    root = git_root()
+    print(f"\n{BOLD}Patch status (live check):{RESET}\n")
+
+    for pp in patches:
+        rel = rel_file_from_patch(pp)
+        text = pp.read_text()
+
+        can_apply   = run(["git", "apply", "--check", "-"],
+                         input=text, text=True, capture_output=True, cwd=root).returncode == 0
+        can_reverse = run(["git", "apply", "--reverse", "--check", "-"],
+                         input=text, text=True, capture_output=True, cwd=root).returncode == 0
+
+        if can_reverse and not can_apply:
+            label, color = "applied  ", GREEN
+        elif can_apply and not can_reverse:
+            label, color = "stripped ", YELLOW
+        elif can_apply and can_reverse:
+            label, color = "clean    ", DIM  # no change in file at all
+        else:
+            label, color = "conflict ", RED
+
+        note = ""
+        if color == RED:
+            note = f"  {DIM}← patch cannot apply or reverse cleanly; file likely changed{RESET}"
+        print(f"  {color}[{label}]{RESET}  {rel}{note}")
+
+    print()
+
+
+def cmd_show(args):
+    rel = resolve_rel(args.file)
+    pp = patch_file(rel)
+    if not pp.exists():
+        print(f"{YELLOW}No saved patch for: {args.file}{RESET}")
+        return
+    print(colorize_diff(pp.read_text()))
+
+
+def cmd_drop(args):
+    rel = resolve_rel(args.file)
+    pp = patch_file(rel)
+    if not pp.exists():
+        print(f"{YELLOW}No saved patch for: {args.file}{RESET}")
+        return
+
+    print(f"{YELLOW}This will delete the local patch for: {rel}{RESET}")
+    print(f"{DIM}Your working tree is not changed — if the patch is currently applied,{RESET}")
+    print(f"{DIM}those changes remain in the file but will no longer be tracked.{RESET}\n")
+
+    try:
+        resp = input(f"Delete? [y/{BOLD}N{RESET}] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{YELLOW}Aborted.{RESET}")
+        return
+
+    if resp != "y":
+        print("Aborted.")
+        return
+
+    pp.unlink()
+    state = load_state()
+    state.pop(rel, None)
+    save_state(state)
+    print(f"{GREEN}✓ Dropped patch for {rel}{RESET}")
+
+
+def cmd_install_hooks(args):
+    hooks_dir = git_dir() / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+
+    script = str(Path(sys.argv[0]).resolve())
+
+    # Pre-commit: strip, then verify something is actually staged.
+    # If stripping empties the index, re-apply and abort — otherwise the commit
+    # would be empty *and* post-commit would never fire (leaving patches stripped).
+    pre_commit_snippet = (
+        "# git-local: strip local-only changes before committing\n"
+        f'"{script}" strip\n'
+        "if git diff --cached --quiet; then\n"
+        "  echo \"git-local: nothing left to commit after stripping local patches — aborting.\" >&2\n"
+        f'  "{script}" apply\n'
+        "  exit 1\n"
+        "fi\n"
+    )
+
+    post_commit_snippet = (
+        "# git-local: re-apply local-only changes after commit completes\n"
+        f'"{script}" apply\n'
+    )
+
+    HOOKS = {
+        "pre-commit":  pre_commit_snippet,
+        "post-commit": post_commit_snippet,
+    }
+
+    print(f"\n{BOLD}Installing git hooks:{RESET}\n")
+
+    for name, snippet in HOOKS.items():
+        hook_path = hooks_dir / name
+        if hook_path.exists():
+            existing = hook_path.read_text()
+            if "git-local" in existing:
+                print(f"  {DIM}{name}: already contains git-local entry — skipping{RESET}")
+                continue
+            hook_path.write_text(existing.rstrip("\n") + "\n\n" + snippet)
+            print(f"  {GREEN}✓ {name}: appended to existing hook{RESET}")
+        else:
+            hook_path.write_text("#!/bin/sh\n" + snippet)
+            hook_path.chmod(0o755)
+            print(f"  {GREEN}✓ {name}: created{RESET}")
+
+    print(f"\n{DIM}Commits will now automatically strip patches before and re-apply after.{RESET}")
+    print(f"{DIM}If local patches are the only staged changes, the commit will be aborted cleanly.{RESET}\n")
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="git-local",
+        description="Persist local-only changes in git-tracked files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  git-local save vite.config.ts     # pick which hunks stay local
+  git-local apply                   # restore local changes
+  git-local strip                   # remove before committing manually
+  git-local status                  # check what's currently applied
+  git-local install-hooks           # automate strip/apply around commits
+""",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("save", help="Interactively select hunks to mark as local-only")
+    s.add_argument("file")
+    s.add_argument("-a", "--all", action="store_true", help="Save all hunks without prompting")
+    s.add_argument("--replace", action="store_true", help="Overwrite existing patch without prompting")
+    s.set_defaults(func=cmd_save)
+
+    s = sub.add_parser("apply", help="Apply saved patches to the working tree")
+    s.add_argument("files", nargs="*", help="Limit to specific files (default: all)")
+    s.add_argument("-f", "--force", action="store_true", help="Re-apply even if marked as already applied")
+    s.set_defaults(func=cmd_apply)
+
+    s = sub.add_parser("strip", help="Remove local patches from the working tree")
+    s.add_argument("files", nargs="*", help="Limit to specific files (default: all)")
+    s.add_argument("-f", "--force", action="store_true", help="Strip even if marked as already stripped")
+    s.set_defaults(func=cmd_strip)
+
+    s = sub.add_parser("list", help="List saved patches and their cached status")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("status", help="Verify actual applied/stripped state via dry-run")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("show", help="Display the saved patch for a file")
+    s.add_argument("file")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("drop", help="Delete the saved patch for a file")
+    s.add_argument("file")
+    s.set_defaults(func=cmd_drop)
+
+    s = sub.add_parser("install-hooks", help="Install pre-commit / post-commit hooks")
+    s.set_defaults(func=cmd_install_hooks)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
