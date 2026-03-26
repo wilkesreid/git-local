@@ -293,6 +293,7 @@ def cmd_strip(args):
 
     filter_files = [resolve_rel(f) for f in args.files] if args.files else []
     stripped = 0
+    failed = 0
 
     for pp in patches:
         rel = rel_file_from_patch(pp)
@@ -316,8 +317,13 @@ def cmd_strip(args):
             if r2.returncode != 0:
                 print(f"{RED}✗ {rel}: could not strip{RESET}")
                 print(f"  {r2.stderr.strip()}")
+                failed += 1
             else:
-                print(f"{GREEN}✓ {rel}: stripped (working tree){RESET}")
+                # Sync the index to the now-stripped working tree so staged local
+                # changes don't sneak into the commit.
+                run(["git", "update-index", "--add", "--", rel],
+                    capture_output=True, cwd=root)
+                print(f"{GREEN}✓ {rel}: stripped (working tree + index synced){RESET}")
                 state[rel] = "stripped"
                 stripped += 1
         else:
@@ -326,6 +332,8 @@ def cmd_strip(args):
             stripped += 1
 
     save_state(state)
+    if failed:
+        sys.exit(1)
 
 
 def cmd_list(args):
@@ -374,7 +382,7 @@ def cmd_status(args):
             label, color = "conflict ", RED
 
         note = ""
-        if color == RED:
+        if label == "conflict ":
             note = f"  {DIM}← patch cannot apply or reverse cleanly; file likely changed{RESET}"
         print(f"  {color}[{label}]{RESET}  {rel}{note}")
 
@@ -419,52 +427,89 @@ def cmd_drop(args):
 
 
 def cmd_install_hooks(args):
-    hooks_dir = git_dir() / "hooks"
-    hooks_dir.mkdir(exist_ok=True)
+    root = git_root()
+    husky_dir = root / ".husky"
+    use_husky = husky_dir.is_dir()
 
     script = str(Path(sys.argv[0]).resolve())
 
-    # Pre-commit: strip, then verify something is actually staged.
-    # If stripping empties the index, re-apply and abort — otherwise the commit
-    # would be empty *and* post-commit would never fire (leaving patches stripped).
-    pre_commit_snippet = (
-        "# git-local: strip local-only changes before committing\n"
-        f'"{script}" strip\n'
-        "if git diff --cached --quiet; then\n"
-        "  echo \"git-local: nothing left to commit after stripping local patches — aborting.\" >&2\n"
-        f'  "{script}" apply\n'
-        "  exit 1\n"
-        "fi\n"
-    )
+    if use_husky:
+        # Snippets use a PATH lookup + guard so they are safe to commit —
+        # teammates without git-local installed skip them silently.
+        pre_commit_snippet = (
+            "# git-local: strip local-only changes before committing\n"
+            "if command -v git-local >/dev/null 2>&1; then\n"
+            "  if ! git-local strip; then\n"
+            "    echo \"git-local: strip failed — aborting commit to avoid committing local-only changes.\" >&2\n"
+            "    exit 1\n"
+            "  fi\n"
+            "  if git diff --cached --quiet; then\n"
+            "    echo \"git-local: nothing left to commit after stripping local patches — aborting.\" >&2\n"
+            "    git-local apply\n"
+            "    exit 1\n"
+            "  fi\n"
+            "fi\n"
+        )
+        post_commit_snippet = (
+            "# git-local: re-apply local-only changes after commit completes\n"
+            "command -v git-local >/dev/null 2>&1 && git-local apply\n"
+        )
+        target_dir = husky_dir
+    else:
+        # Pre-commit: strip, then verify something is actually staged.
+        # If stripping empties the index, re-apply and abort — otherwise the commit
+        # would be empty *and* post-commit would never fire (leaving patches stripped).
+        pre_commit_snippet = (
+            "# git-local: strip local-only changes before committing\n"
+            f'if ! "{script}" strip; then\n'
+            "  echo \"git-local: strip failed — aborting commit to avoid committing local-only changes.\" >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            "if git diff --cached --quiet; then\n"
+            "  echo \"git-local: nothing left to commit after stripping local patches — aborting.\" >&2\n"
+            f'  "{script}" apply\n'
+            "  exit 1\n"
+            "fi\n"
+        )
+        post_commit_snippet = (
+            "# git-local: re-apply local-only changes after commit completes\n"
+            f'"{script}" apply\n'
+        )
+        target_dir = git_dir() / "hooks"
+        target_dir.mkdir(exist_ok=True)
 
-    post_commit_snippet = (
-        "# git-local: re-apply local-only changes after commit completes\n"
-        f'"{script}" apply\n'
-    )
+    if use_husky:
+        print(f"\n{BOLD}Husky detected — installing into .husky/:{RESET}\n")
+        print(f"  {DIM}snippets are guarded so teammates without git-local skip them silently{RESET}\n")
+    else:
+        print(f"\n{BOLD}Installing git hooks:{RESET}\n")
 
-    HOOKS = {
-        "pre-commit":  pre_commit_snippet,
-        "post-commit": post_commit_snippet,
-    }
-
-    print(f"\n{BOLD}Installing git hooks:{RESET}\n")
-
-    for name, snippet in HOOKS.items():
-        hook_path = hooks_dir / name
+    for name, snippet, prepend in [
+        ("pre-commit",  pre_commit_snippet,  use_husky),
+        ("post-commit", post_commit_snippet, False),
+    ]:
+        hook_path = target_dir / name
         if hook_path.exists():
             existing = hook_path.read_text()
             if "git-local" in existing:
                 print(f"  {DIM}{name}: already contains git-local entry — skipping{RESET}")
                 continue
-            hook_path.write_text(existing.rstrip("\n") + "\n\n" + snippet)
-            print(f"  {GREEN}✓ {name}: appended to existing hook{RESET}")
+            if prepend:
+                hook_path.write_text(snippet + "\n" + existing.lstrip("\n"))
+            else:
+                hook_path.write_text(existing.rstrip("\n") + "\n\n" + snippet)
+            print(f"  {GREEN}✓ {name}: {'prepended to' if prepend else 'appended to'} existing hook{RESET}")
         else:
             hook_path.write_text("#!/bin/sh\n" + snippet)
             hook_path.chmod(0o755)
             print(f"  {GREEN}✓ {name}: created{RESET}")
 
-    print(f"\n{DIM}Commits will now automatically strip patches before and re-apply after.{RESET}")
-    print(f"{DIM}If local patches are the only staged changes, the commit will be aborted cleanly.{RESET}\n")
+    if use_husky:
+        print(f"\n{DIM}Commits will now automatically strip patches before and re-apply after.{RESET}")
+        print(f"{DIM}Commit the .husky/ changes so teammates with git-local also benefit.{RESET}\n")
+    else:
+        print(f"\n{DIM}Commits will now automatically strip patches before and re-apply after.{RESET}")
+        print(f"{DIM}If local patches are the only staged changes, the commit will be aborted cleanly.{RESET}\n")
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
