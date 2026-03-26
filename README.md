@@ -38,8 +38,8 @@ git clone https://github.com/wilkesreid/git-local.git
 cd git-local
 
 # Copy the script somewhere on your PATH
+chmod +x ./git-local
 cp git-local /usr/local/bin/git-local
-chmod +x ~/bin/git-local
 
 # Verify
 git-local --help
